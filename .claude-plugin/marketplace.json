@@ -1,0 +1,5 @@
+{
+  "name": "cache-palace",
+  "owner": { "name": "leonwcl95" },
+  "plugins": [{ "name": "cache-palace", "source": "./" }]
+}
