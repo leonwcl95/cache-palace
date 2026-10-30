@@ -2157,7 +2157,7 @@ describe('a managed plugin above the user tier', () => {
     await end($, 'S1', 'resume')
     sid = 'S2'
     await $.prompt.submit(prompt('hi'))
-    expect([...store.keys()].sort()).toEqual(['deadline:S2', 'every:S2'])
+    expect([...store.keys()].sort()).toEqual(['deadline:S2', 'every:S2', 'label:S2'])
     expect(store.get('deadline:S2')).toBe(START + 3 * HOUR)
     expect(store.get('every:S2')).toBe(2 * MIN)
     await $.command.run(run('keepwarm', 'off'))
@@ -2244,7 +2244,7 @@ describe('a managed plugin above the user tier', () => {
     sid = 'S2'
     model = 'claude-haiku-5-5'
     await $.prompt.submit(prompt('hi'))
-    expect([...store.keys()]).toEqual(['deadline:S2'])
+    expect([...store.keys()].sort()).toEqual(['deadline:S2', 'label:S2'])
     expect(store.get('deadline:S2')).toBe(START + 2 * HOUR)
     expect(w.status.at(-1)).toBe('keepwarm 2h00m left · waiting for the first turn')
     expect((await $.command.run(run('cache-palace', ''))).text).toMatch(/^claude-haiku-5-5\n/)
@@ -2282,5 +2282,73 @@ describe('a managed plugin above the user tier', () => {
     expect(w.logs).toEqual([])
     expect(w.status.at(-1)).toBe(undefined)
     expect((await $.command.run(run('cache-palace', ''))).text).toMatch(/session     0 cold writes paid/)
+  })
+})
+
+describe('cap and sessions', () => {
+  const others = (n: number) => new Map<string, unknown>(Array.from({ length: n }, (_, i): [string, unknown] => ['deadline:O' + i, START + 5 * HOUR]))
+
+  test('a window is refused at the cap, with the reason, and nothing is written', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = others(2)
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    expect((await $.command.run(run('keepwarm', 'cap 2'))).text).toMatch(/at most 2 sessions/)
+    const r = await $.command.run(run('keepwarm', '1h'))
+    expect(r.text).toMatch(/^keepwarm not armed: the cap of 2 sessions keeping warm is reached/)
+    expect(store.has('deadline:S1')).toBe(false)
+    expect(w.logs.at(-1)).toMatch(/not keeping this session warm, the cap of 2/)
+  })
+
+  test('a window opens while the others are under the cap, and carries the folder name', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = others(1)
+    world(on, [], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', 'cap 2'))
+    expect((await $.command.run(run('keepwarm', '1h'))).text).toMatch(/^keepwarm on for 1h00m/)
+    expect(store.get('deadline:S1')).toBe(START + HOUR)
+    expect(store.get('label:S1')).toBe('work')
+  })
+
+  test('without a setting the cap is 5, and cap off removes it', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = others(5)
+    world(on, [], { store })
+    await $.session.start(session)
+    expect((await $.command.run(run('keepwarm', '1h'))).text).toMatch(/the cap of 5 sessions/)
+    expect((await $.command.run(run('keepwarm', 'cap off'))).text).toMatch(/cap removed/)
+    expect((await $.command.run(run('keepwarm', '1h'))).text).toMatch(/^keepwarm on for 1h00m/)
+  })
+
+  test('a window that already ended does not count against the cap', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = others(1)
+    store.set('deadline:O0', START - MIN)
+    world(on, [], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', 'cap 1'))
+    expect((await $.command.run(run('keepwarm', '1h'))).text).toMatch(/^keepwarm on for 1h00m/)
+  })
+
+  test('cap takes a whole number or off', async ($, on) => {
+    mock.clock(on, { now: START })
+    world(on, [], { store: new Map() })
+    await $.session.start(session)
+    expect((await $.command.run(run('keepwarm', 'cap many'))).text).toMatch(/^cap takes a whole number/)
+    expect((await $.command.run(run('keepwarm', 'cap 100'))).text).toMatch(/^cap takes a whole number/)
+  })
+
+  test('a window another session removed stops before it pays for a ping', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [warm], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '6h'))
+    await $.turn.complete(turn())
+    store.delete('deadline:S1')
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(0)
+    expect(w.status.at(-1)).toBe('keepwarm stopped: stopped from the Sessions tab of another session')
   })
 })

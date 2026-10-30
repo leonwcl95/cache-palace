@@ -14,7 +14,18 @@ Keeps Claude Code's one-hour prompt cache warm during breaks, stops a cold send 
   - the keepwarm window and next ping, with a button to start or stop it, and a button to switch the guard between "refuse once" and "warn only",
   - the last pings: when, tokens read, tokens written, cost, and whether the cache was warm,
   - the cold writes paid this session, with tokens and cost.
+- **The Sessions tab** lists every session that is keeping warm right now, with its folder name, a short id and the time left. It has a search box and pages of 6, so a long list never fills the pane, and a **Stop** button on each row. It also holds the cap (below).
 - **The row above the prompt**, while keepwarm is armed, and the `/cache-palace` text card, work as in cache-tax.
+
+## The cap
+
+Every session you open can run its own keepwarm timer, and `/keepwarm always` arms all of them. Ten sessions pinging means ten full-context cache reads every 50 minutes. So cache-palace caps how many sessions may keep warm at once. The default is **5**.
+
+- Set it in the Sessions tab (**Cap −**, **Cap +**, **No cap**) or with `/keepwarm cap 8`. `/keepwarm cap off` removes it.
+- At the cap, a session that tries to keep warm is **refused** and told why, in its log, a toast, and its status line. Nothing is written for it.
+- To free a slot, press **Stop** on a session in the list. That session stops itself before its next ping. A session that crashed and left its window behind can be cleared the same way.
+- With `always` on, a stopped session arms itself again at its next turn if a slot is free, so turn `always` off (`/keepwarm off`) if you want it to stay stopped.
+- The count comes from the store all sessions share. Two sessions that open at the very same moment can both pass the check, so the cap can be exceeded by a small amount.
 
 ## Commands
 
@@ -24,6 +35,8 @@ Keeps Claude Code's one-hour prompt cache warm during breaks, stops a cold send 
     /keepwarm always            keep every session warm until six hours after its last turn
     /keepwarm status            the warming window, next ping and last receipt
     /keepwarm off               stop, and turn always off
+    /keepwarm cap 8             allow at most 8 sessions to keep warm at once (default 5)
+    /keepwarm cap off           no cap
     /cache-palace               the text card
     /cache-palace guard warn    show the price and send
     /cache-palace guard refuse  drop a cold send once (the default)

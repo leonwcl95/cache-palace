@@ -17,6 +17,11 @@ const PANE = 'cache-palace'
 const HISTORY = 10 // pings kept for the pane
 const REFRESH_MS = 30 * 1000
 const REFRESH_FOR_MS = 20 * 60 * 1000 // the pane redraws for this long after it is opened, then rests
+const WARM_WARN = 5 // this many sessions pinging at once turns the pane's count orange
+const KEY_CAP = 'cap'
+const KEY_LABEL = 'label'
+const DEFAULT_CAP = 5 // sessions keeping warm at once until the person sets another number; 0 is no cap
+const PAGE = 6 // sessions shown per page in the pane
 
 // Prompts no person sent, so nobody could send them again after a refusal. Every
 // other origin, including sdk, unclassified and the owner's own Slack or channel
@@ -87,6 +92,10 @@ export type State = {
   endingSid: string
   history: PingRecord[]
   refresh: { cancel: () => void } | null
+  // The pane's own view: which tab, which page of sessions, what was typed in the search.
+  view: { tab: string; page: number; query: string }
+  // The folder this session runs in, so the sessions list can name it.
+  label: string
 }
 
 /** What this turn's main requests wrote before any compaction it saw, priced per request where the steps reported usage. */
@@ -264,6 +273,10 @@ function everyKey(s: State): string {
   return `${KEY_EVERY}:${s.sid}`
 }
 
+function labelKey(s: State): string {
+  return `${KEY_LABEL}:${s.sid}`
+}
+
 /** Clears this session's own dead window and the bare keys a store written before 2.1.1 still holds. Other sessions' keys are never touched: a read followed by a delete cannot be made atomic against their renewal. */
 async function prune($: EngineInterface, s: State, now: number) {
   for (const key of [KEY_DEADLINE, deadlineKey(s)]) {
@@ -289,6 +302,7 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
   disarm(s)
   await $.store.delete(deadlineKey(s))
   await $.store.delete(everyKey(s))
+  await $.store.delete(labelKey(s))
   if (forgetAlways) await $.store.delete(KEY_ALWAYS)
   updateStatus($, s, await $.clock.now())
 }
@@ -297,7 +311,7 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
 async function endConversation($: EngineInterface, s: State, reason: 'clear' | 'resume') {
   // Claimed before any await: a second end or a classic start for the same conversation finds it already gone, and an
   // end cut short by its budget leaves no timer and no old id behind, only the keys below.
-  const keys = [deadlineKey(s), everyKey(s)]
+  const keys = [deadlineKey(s), everyKey(s), labelKey(s)]
   const ending = s.sid
   resetForClear(s)
   s.sid = ''
@@ -384,6 +398,8 @@ async function ping($: EngineInterface, s: State) {
   if (now - s.lastRequestAt < s.every - 1000) return arm($, s)
   // A host that slept past a retry's slot must not send it inside the last minute.
   if (s.retries && now >= s.lastRequestAt + TTL_MS - MIN_PING_MS) return stop($, s, s.retryReason + afterRetries(s.retries))
+  // Another session's pane removed this window's key: stop instead of paying for a ping nobody wants now.
+  if (s.sid && (await $.store.get(deadlineKey(s))) === undefined) return stop($, s, 'stopped from the Sessions tab of another session')
   const gen = s.gen
   const sentAt = s.lastRequestAt
   s.inFlight = true
@@ -451,6 +467,7 @@ function armedText(s: State, now: number, windowMs: number): string {
 // before deciding to open a window passes the count it read first.
 async function startWindow($: EngineInterface, s: State, windowMs: number, every: number, offs = s.offs) {
   if (s.offs !== offs) return
+  if (!(await capAllows($, s))) return
   const now = await $.clock.now()
   if (s.offs !== offs) return
   const deadline = now + windowMs
@@ -462,6 +479,7 @@ async function startWindow($: EngineInterface, s: State, windowMs: number, every
   if (every === PING_AFTER_MS) await $.store.delete(everyKey(s))
   else await $.store.set(everyKey(s), every)
   await $.store.set(deadlineKey(s), deadline)
+  if (s.label) await $.store.set(labelKey(s), s.label)
   if (s.offs !== offs) {
     // Remove only what this call wrote; a window armed after the off is left alone.
     if ((await $.store.get(deadlineKey(s))) === deadline) {
@@ -498,7 +516,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     resumedAt: 0, transcript: 0, guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
-    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null, steps: 0, endingSid: '', history: [], refresh: null,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null, steps: 0, endingSid: '', history: [], refresh: null, view: { tab: 'cache', page: 0, query: '' }, label: '',
   }
 }
 
@@ -509,6 +527,53 @@ async function tryRegister($: EngineInterface, spec: any) {
   } catch (err) {
     $.ui.log(`cache-palace: could not register /${spec.name} (${err instanceof Error ? err.message : String(err)}). If the original cache-tax is still on, turn it off and run /reload-plugins.`)
   }
+}
+
+type Warming = { sid: string; label: string; left: number; every: number }
+
+/** Every session whose keepwarm window is still open, read from the store all sessions share. A session that crashed counts until its window would have ended. */
+async function warmSessions($: EngineInterface, now: number): Promise<Warming[]> {
+  const out: Warming[] = []
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(`${KEY_DEADLINE}:`)) continue
+    const deadline = await $.store.get(key)
+    if (typeof deadline !== 'number' || deadline <= now) continue
+    const sid = key.slice(KEY_DEADLINE.length + 1)
+    const every = await $.store.get(`${KEY_EVERY}:${sid}`)
+    const label = await $.store.get(`${KEY_LABEL}:${sid}`)
+    out.push({ sid, label: typeof label === 'string' ? label : '', left: deadline - now, every: typeof every === 'number' ? every : PING_AFTER_MS })
+  }
+  return out.sort((a, b) => b.left - a.left)
+}
+
+async function readCap($: EngineInterface): Promise<number> {
+  const cap = await $.store.get(KEY_CAP)
+  return typeof cap === 'number' && Number.isInteger(cap) && cap >= 0 ? cap : DEFAULT_CAP
+}
+
+async function setCap($: EngineInterface, cap: number) {
+  await $.store.set(KEY_CAP, cap)
+}
+
+/** May this session open or renew a window? Counts the other sessions still keeping warm; at the cap the window is refused, and a window this session already had is ended, with the reason told to the person. */
+async function capAllows($: EngineInterface, s: State): Promise<boolean> {
+  const cap = await readCap($)
+  if (cap === 0) return true
+  const others = (await warmSessions($, await $.clock.now())).filter(w => w.sid !== s.sid)
+  if (others.length < cap) return true
+  const why = `the cap of ${cap} sessions keeping warm is reached. Open /palace, Sessions tab, stop one or raise the cap`
+  await stop($, s, why)
+  $.ui.log(`cache-palace: not keeping this session warm, ${why}.`)
+  $.ui.toast('cache-palace: the keepwarm cap is reached')
+  return false
+}
+
+/** Ends another session's window by removing its keys: that session checks for them before every ping and stops itself. This session's own is stopped as /keepwarm off would. */
+async function stopSession($: EngineInterface, s: State, sid: string) {
+  if (sid === s.sid) return stop($, s, null)
+  await $.store.delete(`${KEY_DEADLINE}:${sid}`)
+  await $.store.delete(`${KEY_EVERY}:${sid}`)
+  await $.store.delete(`${KEY_LABEL}:${sid}`)
 }
 
 /** Redraws the pane on a slow tick so its countdowns move, for a while after it opens; an unopened pane costs nothing. */
@@ -568,6 +633,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
     s.hasBand = e.surface === 'terminal' || e.surface === 'desktop'
+    s.label = String(e.cwd ?? '').split(/[\/]/).filter(Boolean).pop() ?? ''
     if (s.hasBand) {
       const theme = (await $.config.list()).find(row => row.key === 'theme')?.value
       light = typeof theme === 'string' && theme.startsWith('light')
@@ -649,15 +715,23 @@ export const register: Register = on => {
       await stop($, s, null, true)
       return { text: wasAlways ? 'keepwarm is off, and always is off for every session from its next turn' : 'keepwarm is off' }
     }
+    if (words[0] === 'cap') {
+      const n = words[1] === 'off' ? 0 : Number(words[1])
+      if (!Number.isInteger(n) || n < 0 || n > 99) return { text: 'cap takes a whole number from 1 to 99, or off for no cap' }
+      await setCap($, n)
+      return { text: n === 0 ? 'cap removed: any number of sessions may keep warm' : `cap set: at most ${n} sessions keep warm at once` }
+    }
     if (words[0] === 'always') {
       s.always = true
       await $.store.set(KEY_ALWAYS, true)
       await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
+      if (s.stopped && !s.deadline) return { text: `keepwarm not armed: ${s.stopped}` }
       const cold = isCold(s, now) ? `. The cache is cold now, so the first ping comes ${fmtDuration(s.every)} after the next turn` : ''
       return { text: `keepwarm always on: every session stays warm until ${fmtDuration(DEFAULT_WINDOW_MS)} after its last turn; /keepwarm off turns it off for good${cold}` }
     }
     if (!words.length) {
       await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
+      if (s.stopped && !s.deadline) return { text: `keepwarm not armed: ${s.stopped}` }
       return { text: armedText(s, now, DEFAULT_WINDOW_MS) }
     }
     if (words[0] !== 'status') {
@@ -672,6 +746,7 @@ export const register: Register = on => {
         every = period
       }
       await startWindow($, s, window, every)
+      if (s.stopped && !s.deadline) return { text: `keepwarm not armed: ${s.stopped}` }
       const rolls = s.always && (window < DEFAULT_WINDOW_MS || every !== PING_AFTER_MS)
       return { text: armedText(s, now, window) + (rolls ? `. Always is on, so your next turn makes it at least ${fmtDuration(DEFAULT_WINDOW_MS)} at one ping per ${fmtDuration(PING_AFTER_MS)}` : '') }
     }
@@ -699,7 +774,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const { Box, Text, Button, Input } = $.ui.resolve(e)
     const now = await $.clock.now()
     const state = s.stopped ? 'stopped' : !s.lastRequestAt || s.compacted ? 'unknown' : isCold(s, now) ? 'cold' : 'warm'
     const hue = state === 'warm' ? 'green' : state === 'cold' ? '#d97757' : undefined
@@ -717,14 +792,16 @@ export const register: Register = on => {
     const redraw = () => $.ui.invalidate('ui.render')
     const pings = breakEvenPings(s)
     const paid = s.misses.reduce((a, m) => a + (m.usd ?? 0), 0)
+    const warm = await warmSessions($, now)
+    const cap = await readCap($)
+    const full = cap > 0 && warm.length >= cap
+    const many = warm.length >= WARM_WARN
+    const perHour = warm.reduce((n, w) => n + 3_600_000 / w.every, 0)
+    const of = cap > 0 ? ` of ${cap}` : ' (no cap)'
+    const tab = (id: string, name: string) =>
+      Button({ key: `tab-${id}`, variant: s.view.tab === id ? 'primary' : undefined, onPress: async () => { s.view = { tab: id, page: 0, query: '' }; redraw() }, children: [name] })
 
-    return Box({ flexDirection: 'column', gap: 1, paddingX: 2, paddingY: 1, children: [
-      Box({ flexDirection: 'column', children: [
-        Text({ bold: true, color: 'magenta', children: ['Cache palace'] }),
-        Text({ dimColor: true, children: [s.lastModel ?? 'model not seen yet'] }),
-      ] }),
-      Text({ bold: true, color: hue, children: [`● ${headline}`] }),
-
+    const cacheCards = [
       card('cyan', [
         Text({ bold: true, children: ['The room'] }),
         Box({ flexDirection: 'column', children: [
@@ -744,6 +821,15 @@ export const register: Register = on => {
             : Button({ key: 'warm', variant: 'primary', onPress: async () => { await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS); redraw() }, children: [`Keep warm ${fmtDuration(DEFAULT_WINDOW_MS)}`] }),
           Button({ key: 'guard', onPress: async () => { await setGuard($, s, s.guard === 'refuse' ? 'warn' : 'refuse'); redraw() }, children: [s.guard === 'refuse' ? 'Guard: refuse once' : 'Guard: warn only'] }),
         ] }),
+      ]),
+
+      card(full ? '#d97757' : 'cyan', [
+        Text({ bold: true, color: full ? '#d97757' : undefined, children: [`Sessions keeping warm: ${warm.length}${of}`] }),
+        Text({ children: [full
+          ? 'The cap is reached: new windows are refused until you free a slot.'
+          : many ? 'Many sessions are pinging at once. Each ping re-reads that session\'s whole context.'
+          : 'Each one keeps its cache alive with a ping every 50 minutes.'] }),
+        Button({ key: 'manage', onPress: async () => { s.view = { tab: 'sessions', page: 0, query: '' }; redraw() }, children: ['Manage sessions'] }),
       ]),
 
       card('cyan', [
@@ -775,7 +861,62 @@ export const register: Register = on => {
               ] })),
             ] }),
       ]),
+    ]
 
+    // Sessions tab: what is keeping warm now, searchable and paged so a long list never fills the pane.
+    const q = s.view.query.trim().toLowerCase()
+    const found = warm.filter(w => q === '' || `${w.label} ${w.sid}`.toLowerCase().includes(q))
+    const pages = Math.max(1, Math.ceil(found.length / PAGE))
+    const page = Math.min(s.view.page, pages - 1)
+    const shown = found.slice(page * PAGE, page * PAGE + PAGE)
+    const go = (to: number) => async () => { s.view = { ...s.view, page: Math.max(0, Math.min(pages - 1, to)) }; redraw() }
+
+    const sessionCards = [
+      card(full ? '#d97757' : 'cyan', [
+        Text({ bold: true, color: full ? '#d97757' : undefined, children: [`Keeping warm: ${warm.length}${of}`] }),
+        Text({ children: [full
+          ? 'The cap is reached. A session that tries to keep warm now is refused, and tells its person why. Stop one below to free a slot, or raise the cap.'
+          : cap === 0 ? 'No cap is set, so any number of sessions can keep warm at once.'
+          : `${cap - warm.length} slot${cap - warm.length === 1 ? '' : 's'} free.`] }),
+        ...(warm.length > 0 ? [Text({ dimColor: true, children: [`About ${perHour.toFixed(1)} pings an hour across them, each re-reading that session's whole context.`] })] : []),
+        ...(s.always ? [Text({ color: '#d97757', children: ['Always is on: every session arms itself and renews on each turn, so a stopped one comes back at its next turn if a slot is free. /keepwarm off turns always off for all of them.'] })] : []),
+        Box({ gap: 2, children: [
+          Button({ key: 'cap-down', onPress: async () => { await setCap($, Math.max(1, (cap || warm.length + 1) - 1)); redraw() }, children: ['Cap −'] }),
+          Text({ bold: true, children: [cap === 0 ? 'no cap' : `cap ${cap}`] }),
+          Button({ key: 'cap-up', onPress: async () => { await setCap($, Math.min(99, (cap || warm.length) + 1)); redraw() }, children: ['Cap +'] }),
+          Button({ key: 'cap-off', onPress: async () => { await setCap($, 0); redraw() }, children: ['No cap'] }),
+        ] }),
+      ]),
+
+      card('magenta', [
+        Input({ key: 'find', label: 'Search ', placeholder: 'folder or id', value: s.view.query, onInput: (v: string) => { s.view = { ...s.view, query: v, page: 0 }; redraw() }, onSubmit: () => {} }),
+        warm.length === 0
+          ? Text({ dimColor: true, children: ['No session is keeping warm.'] })
+          : found.length === 0
+            ? Text({ dimColor: true, children: ['No match.'] })
+            : Box({ flexDirection: 'column', gap: 1, children: shown.map(w => Box({ key: `warm-${w.sid}`, children: [
+                cell(18, w.label || '(no folder)'),
+                cell(11, `${w.sid.slice(0, 8)}${w.sid === s.sid ? ' *' : ''}`, false, undefined, true),
+                cell(11, `${fmtDuration(w.left)} left`, true),
+                Box({ paddingLeft: 2, children: [Button({ key: `stop-${w.sid}`, onPress: async () => { await stopSession($, s, w.sid); redraw() }, children: ['Stop'] })] }),
+              ] })) }),
+        ...(found.length > PAGE ? [Box({ gap: 2, children: [
+          Button({ key: 'prev', onPress: go(page - 1), children: ['Prev'] }),
+          Text({ dimColor: true, children: [`${page * PAGE + 1}-${Math.min(found.length, page * PAGE + PAGE)} of ${found.length}`] }),
+          Button({ key: 'next', onPress: go(page + 1), children: ['Next'] }),
+        ] })] : []),
+        Text({ dimColor: true, children: ['* this session. Stop removes that session\'s window; it stops itself before its next ping. Counted from the store every session shares, so a session that crashed still counts until its window ends.'] }),
+      ]),
+    ]
+
+    return Box({ flexDirection: 'column', gap: 1, paddingX: 2, paddingY: 1, children: [
+      Box({ flexDirection: 'column', children: [
+        Text({ bold: true, color: 'magenta', children: ['Cache palace'] }),
+        Text({ dimColor: true, children: [s.lastModel ?? 'model not seen yet'] }),
+      ] }),
+      Text({ bold: true, color: hue, children: [`● ${headline}`] }),
+      Box({ gap: 2, children: [tab('cache', 'Cache'), tab('sessions', `Sessions ${warm.length}${cap > 0 ? ` / ${cap}` : ''}`)] }),
+      ...(s.view.tab === 'sessions' ? sessionCards : cacheCards),
       Text({ dimColor: true, children: ['Warm or cold comes from a one-hour clock, not a server check. Dollar figures are API list prices; on a subscription they are a yardstick, not your bill.'] }),
     ] })
   })
