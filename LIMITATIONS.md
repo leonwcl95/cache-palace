@@ -22,14 +22,14 @@ cache-palace is cache-tax 2.3.1 plus a pane. Everything below is about what was 
 ## Sessions and the cap
 
 - **The cap is a change of behavior from cache-tax**, which has none. The default is 5 sessions keeping warm at once; `/keepwarm cap off` removes it.
-- **It is not atomic.** The check reads the shared store and then writes. Two sessions arming at the same instant can both pass, so the cap can be exceeded by a small amount.
+- **It is not atomic.** The check reads the shared store and then writes, so two sessions arming at the same instant can both pass. Each recounts after writing and before every ping, and ends if it ranks below the cap, so the excess lasts at most until the next recount, not for the whole window.
 - **Stopping another session works by removing its keys.** That session notices only when its next ping is due (up to 50 minutes later) and then stops without sending it. Until then its status line still shows a window.
 - **`always` brings a stopped session back** at its next turn if a slot is free.
 - **A crashed session counts until its window ends**, which can be hours. **Stop** clears it.
-- **A lowered cap ends windows lazily.** Sessions above the new cap are not stopped at once; each is refused when it next opens or renews its window, and a window it already holds ends then.
-- **The folder name** shown for each session is the last part of its working directory, stored beside its window. A session that armed a window before this version has no name and shows `(no folder)`.
+- **A lowered cap ends windows at once**, the ones with the least time left, by removing their keys. Those sessions stop at their next ping like any session stopped from the list.
+- **The name** shown for each session is its project: the last part of its working directory, the repo for a `.claude/worktrees` checkout, and "No folder" for the desktop app's scratch folder. A name stored by an older version is shortened the same way when shown. A session that armed a window before the names existed shows `(no folder)`.
 - **Pings per hour is an estimate** from each session's interval. The other sessions' context sizes are not known, so no cost is shown for them.
-- **Tested:** the cap, refusal, `cap off` and bad input, ended windows not counting, and a removed window stopping before its ping (6 new tests, 166 in all). **Not tested:** the Sessions tab itself (search, paging, the cap buttons, the Stop buttons) and the tab switch.
+- **Tested:** the cap, refusal, `cap off` and bad input, ended windows not counting, and a removed window stopping before its ping , a lowered cap ending the extra windows, and the project-name rules (8 new tests, 168 in all, all passing). **Not tested:** the recount after a simultaneous open, the check before a ping, the Sessions tab itself (search, paging, the cap buttons, the Stop buttons) and the tab switch.
 
 ## What changed from cache-tax
 

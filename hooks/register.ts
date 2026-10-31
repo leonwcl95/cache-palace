@@ -273,6 +273,15 @@ function everyKey(s: State): string {
   return `${KEY_EVERY}:${s.sid}`
 }
 
+/** The project a folder path stands for: its last segment, the repo for a .claude/worktrees checkout, "No folder" for the app's scratch folder. Plain names pass through. */
+export function projectName(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean)
+  if (parts.includes('scratch-workspaces')) return 'No folder'
+  const wt = parts.indexOf('worktrees')
+  if (wt > 1 && parts[wt - 1] === '.claude') return parts[wt - 2]
+  return parts.pop() ?? ''
+}
+
 function labelKey(s: State): string {
   return `${KEY_LABEL}:${s.sid}`
 }
@@ -400,6 +409,8 @@ async function ping($: EngineInterface, s: State) {
   if (s.retries && now >= s.lastRequestAt + TTL_MS - MIN_PING_MS) return stop($, s, s.retryReason + afterRetries(s.retries))
   // Another session's pane removed this window's key: stop instead of paying for a ping nobody wants now.
   if (s.sid && (await $.store.get(deadlineKey(s))) === undefined) return stop($, s, 'stopped from the Sessions tab of another session')
+  // A lowered cap, or a race at opening, can leave more windows than the cap: the one over it ends here, before it pays.
+  if (await overCap($, s)) return stop($, s, capWhy(await readCap($)))
   const gen = s.gen
   const sentAt = s.lastRequestAt
   s.inFlight = true
@@ -480,6 +491,13 @@ async function startWindow($: EngineInterface, s: State, windowMs: number, every
   else await $.store.set(everyKey(s), every)
   await $.store.set(deadlineKey(s), deadline)
   if (s.label) await $.store.set(labelKey(s), s.label)
+  // The check above and these writes are not atomic against another session opening now: recount once written.
+  if (await overCap($, s)) {
+    const why = capWhy(await readCap($))
+    await stop($, s, why)
+    $.ui.log(`cache-palace: not keeping this session warm, ${why}.`)
+    return
+  }
   if (s.offs !== offs) {
     // Remove only what this call wrote; a window armed after the off is left alone.
     if ((await $.store.get(deadlineKey(s))) === deadline) {
@@ -541,9 +559,21 @@ async function warmSessions($: EngineInterface, now: number): Promise<Warming[]>
     const sid = key.slice(KEY_DEADLINE.length + 1)
     const every = await $.store.get(`${KEY_EVERY}:${sid}`)
     const label = await $.store.get(`${KEY_LABEL}:${sid}`)
-    out.push({ sid, label: typeof label === 'string' ? label : '', left: deadline - now, every: typeof every === 'number' ? every : PING_AFTER_MS })
+    // Run through projectName again: a window written by an older version holds the whole path.
+    out.push({ sid, label: typeof label === 'string' ? projectName(label) : '', left: deadline - now, every: typeof every === 'number' ? every : PING_AFTER_MS })
   }
-  return out.sort((a, b) => b.left - a.left)
+  // Most time left first, the id breaking a tie: every session ranks the same list, so each reaches the same verdict.
+  return out.sort((a, b) => b.left - a.left || (a.sid < b.sid ? -1 : 1))
+}
+
+const capWhy = (cap: number) => `the cap of ${cap} sessions keeping warm is reached. Open /palace, Sessions tab, stop one or raise the cap`
+
+/** True when this session's open window ranks below the cap. Two sessions that opened at the same instant both see the same ranking, so only the last one ends. */
+async function overCap($: EngineInterface, s: State): Promise<boolean> {
+  const cap = await readCap($)
+  if (cap === 0) return false
+  const warm = await warmSessions($, await $.clock.now())
+  return warm.findIndex(w => w.sid === s.sid) >= cap
 }
 
 async function readCap($: EngineInterface): Promise<number> {
@@ -551,8 +581,12 @@ async function readCap($: EngineInterface): Promise<number> {
   return typeof cap === 'number' && Number.isInteger(cap) && cap >= 0 ? cap : DEFAULT_CAP
 }
 
-async function setCap($: EngineInterface, cap: number) {
+/** Saves the cap and, when the warm count is above it, ends the windows with the least time left, as Stop does. */
+async function setCap($: EngineInterface, s: State, cap: number) {
   await $.store.set(KEY_CAP, cap)
+  if (cap === 0) return
+  const warm = await warmSessions($, await $.clock.now())
+  for (const w of warm.slice(cap)) await stopSession($, s, w.sid)
 }
 
 /** May this session open or renew a window? Counts the other sessions still keeping warm; at the cap the window is refused, and a window this session already had is ended, with the reason told to the person. */
@@ -561,7 +595,7 @@ async function capAllows($: EngineInterface, s: State): Promise<boolean> {
   if (cap === 0) return true
   const others = (await warmSessions($, await $.clock.now())).filter(w => w.sid !== s.sid)
   if (others.length < cap) return true
-  const why = `the cap of ${cap} sessions keeping warm is reached. Open /palace, Sessions tab, stop one or raise the cap`
+  const why = capWhy(cap)
   await stop($, s, why)
   $.ui.log(`cache-palace: not keeping this session warm, ${why}.`)
   $.ui.toast('cache-palace: the keepwarm cap is reached')
@@ -633,7 +667,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
     s.hasBand = e.surface === 'terminal' || e.surface === 'desktop'
-    s.label = String(e.cwd ?? '').split(/[\/]/).filter(Boolean).pop() ?? ''
+    s.label = projectName(String(e.cwd ?? ''))
     if (s.hasBand) {
       const theme = (await $.config.list()).find(row => row.key === 'theme')?.value
       light = typeof theme === 'string' && theme.startsWith('light')
@@ -652,7 +686,7 @@ export const register: Register = on => {
     // Always means a fresh default window every session, whatever the last one left behind.
     if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
     // The classic start arms a restored window too, but a managed plugin above this tier may continue beneath it; arming twice leaves one timer.
-    else if (s.deadline) await arm($, s)
+    else if (s.deadline && (await capAllows($, s))) await arm($, s)
     await tryRegister($, {
       name: 'keepwarm',
       description: 'Keep the prompt cache warm: bare for 6h, a window such as 90m, always, off, or status (cache-palace)',
@@ -718,7 +752,7 @@ export const register: Register = on => {
     if (words[0] === 'cap') {
       const n = words[1] === 'off' ? 0 : Number(words[1])
       if (!Number.isInteger(n) || n < 0 || n > 99) return { text: 'cap takes a whole number from 1 to 99, or off for no cap' }
-      await setCap($, n)
+      await setCap($, s, n)
       return { text: n === 0 ? 'cap removed: any number of sessions may keep warm' : `cap set: at most ${n} sessions keep warm at once` }
     }
     if (words[0] === 'always') {
@@ -874,6 +908,7 @@ export const register: Register = on => {
     const sessionCards = [
       card(full ? '#d97757' : 'cyan', [
         Text({ bold: true, color: full ? '#d97757' : undefined, children: [`Keeping warm: ${warm.length}${of}`] }),
+        ...(cap > 0 ? [Text({ color: full ? '#d97757' : 'green', children: ['●'.repeat(Math.min(warm.length, cap)) + '○'.repeat(Math.max(0, cap - warm.length))] })] : []),
         Text({ children: [full
           ? 'The cap is reached. A session that tries to keep warm now is refused, and tells its person why. Stop one below to free a slot, or raise the cap.'
           : cap === 0 ? 'No cap is set, so any number of sessions can keep warm at once.'
@@ -881,10 +916,10 @@ export const register: Register = on => {
         ...(warm.length > 0 ? [Text({ dimColor: true, children: [`About ${perHour.toFixed(1)} pings an hour across them, each re-reading that session's whole context.`] })] : []),
         ...(s.always ? [Text({ color: '#d97757', children: ['Always is on: every session arms itself and renews on each turn, so a stopped one comes back at its next turn if a slot is free. /keepwarm off turns always off for all of them.'] })] : []),
         Box({ gap: 2, children: [
-          Button({ key: 'cap-down', onPress: async () => { await setCap($, Math.max(1, (cap || warm.length + 1) - 1)); redraw() }, children: ['Cap −'] }),
+          Button({ key: 'cap-down', onPress: async () => { await setCap($, s, Math.max(1, (cap || warm.length + 1) - 1)); redraw() }, children: ['Cap −'] }),
           Text({ bold: true, children: [cap === 0 ? 'no cap' : `cap ${cap}`] }),
-          Button({ key: 'cap-up', onPress: async () => { await setCap($, Math.min(99, (cap || warm.length) + 1)); redraw() }, children: ['Cap +'] }),
-          Button({ key: 'cap-off', onPress: async () => { await setCap($, 0); redraw() }, children: ['No cap'] }),
+          Button({ key: 'cap-up', onPress: async () => { await setCap($, s, Math.min(99, (cap || warm.length) + 1)); redraw() }, children: ['Cap +'] }),
+          Button({ key: 'cap-off', onPress: async () => { await setCap($, s, 0); redraw() }, children: ['No cap'] }),
         ] }),
       ]),
 
@@ -895,8 +930,8 @@ export const register: Register = on => {
           : found.length === 0
             ? Text({ dimColor: true, children: ['No match.'] })
             : Box({ flexDirection: 'column', gap: 1, children: shown.map(w => Box({ key: `warm-${w.sid}`, children: [
-                cell(18, w.label || '(no folder)'),
-                cell(11, `${w.sid.slice(0, 8)}${w.sid === s.sid ? ' *' : ''}`, false, undefined, true),
+                cell(26, w.label || '(no folder)', false, w.sid === s.sid ? 'green' : undefined),
+                cell(14, w.sid === s.sid ? 'this session' : w.sid.slice(0, 8), false, undefined, true),
                 cell(11, `${fmtDuration(w.left)} left`, true),
                 Box({ paddingLeft: 2, children: [Button({ key: `stop-${w.sid}`, onPress: async () => { await stopSession($, s, w.sid); redraw() }, children: ['Stop'] })] }),
               ] })) }),
@@ -905,7 +940,7 @@ export const register: Register = on => {
           Text({ dimColor: true, children: [`${page * PAGE + 1}-${Math.min(found.length, page * PAGE + PAGE)} of ${found.length}`] }),
           Button({ key: 'next', onPress: go(page + 1), children: ['Next'] }),
         ] })] : []),
-        Text({ dimColor: true, children: ['* this session. Stop removes that session\'s window; it stops itself before its next ping. Counted from the store every session shares, so a session that crashed still counts until its window ends.'] }),
+        Text({ dimColor: true, children: ['Stop ends that session\'s window; it stops itself before its next ping. A crashed session counts until its window ends.'] }),
       ]),
     ]
 

@@ -1,6 +1,6 @@
 {
   "name": "cache-palace",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Keeps the one-hour prompt cache warm during breaks, stops a cold send once with its rewrite price, and opens a pane showing the cache's state, pings and cold writes. A modified copy of cache-tax by Karan Bansal. Warming uses model requests and costs tokens. Requires Claude Code 2.1.287+.",
   "author": {
     "name": "leonwcl95 (based on cache-tax by Karan Bansal)"

@@ -14,7 +14,7 @@ Keeps Claude Code's one-hour prompt cache warm during breaks, stops a cold send 
   - the keepwarm window and next ping, with a button to start or stop it, and a button to switch the guard between "refuse once" and "warn only",
   - the last pings: when, tokens read, tokens written, cost, and whether the cache was warm,
   - the cold writes paid this session, with tokens and cost.
-- **The Sessions tab** lists every session that is keeping warm right now, with its folder name, a short id and the time left. It has a search box and pages of 6, so a long list never fills the pane, and a **Stop** button on each row. It also holds the cap (below).
+- **The Sessions tab** lists every session that is keeping warm right now, with its project name (the folder, or the repo for a worktree, or "No folder"), a short id (your own row says "this session") and the time left. A row of dots shows used and free slots. It has a search box and pages of 6, so a long list never fills the pane, and a **Stop** button on each row. It also holds the cap (below).
 - **The row above the prompt**, while keepwarm is armed, and the `/cache-palace` text card, work as in cache-tax.
 
 ## The cap
@@ -25,7 +25,9 @@ Every session you open can run its own keepwarm timer, and `/keepwarm always` ar
 - At the cap, a session that tries to keep warm is **refused** and told why, in its log, a toast, and its status line. Nothing is written for it.
 - To free a slot, press **Stop** on a session in the list. That session stops itself before its next ping. A session that crashed and left its window behind can be cleared the same way.
 - With `always` on, a stopped session arms itself again at its next turn if a slot is free, so turn `always` off (`/keepwarm off`) if you want it to stay stopped.
-- The count comes from the store all sessions share. Two sessions that open at the very same moment can both pass the check, so the cap can be exceeded by a small amount.
+- Lowering the cap ends the windows above it at once, keeping the sessions with the most time left.
+- The cap is checked again after a window is written and before every ping. Sessions rank by time left, the id breaking a tie, so two that open at the same moment agree on which one ends.
+- The count comes from the store all sessions share.
 
 ## Commands
 

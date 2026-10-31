@@ -3,7 +3,7 @@ import type { Plugin, TestBody } from 'claude-code/testing'
 import type { CommandRunInput, ConfigSetInput, ModelForkResult, On, PromptSubmitInput, RenderPropsOf, SessionStartInput, TurnCompleteInput, TurnUsage } from 'claude-code'
 
 import { statusIcons } from '../hooks/status-icons'
-import { fmtDuration, freshState, parseDuration, resetForClear, seedFromResume } from '../hooks/register'
+import { fmtDuration, freshState, parseDuration, projectName, resetForClear, seedFromResume } from '../hooks/register'
 
 tier('user')
 
@@ -2350,5 +2350,26 @@ describe('cap and sessions', () => {
     await clock.advance(50 * MIN)
     expect(w.forks.length).toBe(0)
     expect(w.status.at(-1)).toBe('keepwarm stopped: stopped from the Sessions tab of another session')
+  })
+
+  test('lowering the cap ends the windows with the least time left, the id breaking a tie', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = others(3)
+    store.set('every:O2', 10 * MIN)
+    store.set('label:O2', 'old')
+    world(on, [], { store })
+    await $.session.start(session)
+    expect((await $.command.run(run('keepwarm', 'cap 1'))).text).toMatch(/at most 1 sessions/)
+    expect([...store.keys()].sort()).toEqual(['cap', 'deadline:O0'])
+  })
+
+  test('the folder shown is the project, not the path', () => {
+    expect(projectName(String.raw`C:\Users\L\Desktop\My Projects\CultivaV2`)).toBe('CultivaV2')
+    expect(projectName('/home/me/app/')).toBe('app')
+    expect(projectName('/home/me/app/.claude/worktrees/fix-x')).toBe('app')
+    expect(projectName(String.raw`C:\p\.claude\worktrees\w`)).toBe('p')
+    expect(projectName(String.raw`C:\a\Claude-Data\scratch-workspaces\x\scratch-1`)).toBe('No folder')
+    expect(projectName('work')).toBe('work')
+    expect(projectName('')).toBe('')
   })
 })
